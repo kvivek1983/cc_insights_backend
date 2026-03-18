@@ -28,12 +28,21 @@ WITH att AS (
     AND a.created_date >= CURRENT_DATE::timestamp AND a.created_date < (CURRENT_DATE + INTERVAL '1 day')::timestamp
   GROUP BY ucm.division_id, emp.total_employees
 ),
+fuel_ranked AS (
+  SELECT *, ROW_NUMBER() OVER (
+    PARTITION BY bus_id, expense_date, total_amount, volume_in_liter
+    ORDER BY fuel_expense_id
+  ) AS rn
+  FROM fuel_expense_master
+  WHERE is_deleted = false AND company_id = $1
+    AND fuel_expense_id != 12
+    AND total_amount < 1000000 AND volume_in_liter BETWEEN 1 AND 500 AND fuel_price BETWEEN 50 AND 150
+),
+fuel_dedup AS (SELECT * FROM fuel_ranked WHERE rn = 1),
 fuel AS (
   SELECT fe.division_id, ROUND(SUM(fe.total_amount)::numeric / 100000, 2) AS fuel_spend_lakhs
-  FROM fuel_expense_master fe
-  WHERE fe.is_deleted = false AND fe.company_id = $1 AND fe.fuel_expense_id != 12
-    AND fe.total_amount < 1000000 AND fe.volume_in_liter BETWEEN 1 AND 500 AND fe.fuel_price BETWEEN 50 AND 150
-    AND fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE)
+  FROM fuel_dedup fe
+  WHERE fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE)
   GROUP BY fe.division_id
 ),
 routes AS (

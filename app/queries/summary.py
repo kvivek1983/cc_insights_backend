@@ -1,39 +1,66 @@
 """
 SQL query constants for the Today Summary endpoint.
 
-All queries use asyncpg-style parameterized placeholders ($1, $2, ...).
-Common rules enforced in all relevant queries:
+All fuel queries use a dedup CTE to exclude duplicate entries (same bus+date+amount+volume,
+keeping only the earliest fuel_expense_id per group).
+
+Common rules:
   - is_deleted = false
-  - fuel_expense_id != 12 (excluded pump type)
-  - Fuel quality filters: total_amount < 1000000, volume_in_liter BETWEEN 1 AND 500,
-    fuel_price BETWEEN 50 AND 150
+  - fuel_expense_id != 12
+  - Fuel quality: total_amount < 1000000, volume_in_liter BETWEEN 1 AND 500, fuel_price BETWEEN 50 AND 150
   - $1 is always company_id
 """
 
-FUEL_TODAY_YESTERDAY = """
+# Dedup CTE used in all fuel queries
+_FUEL_DEDUP = """
+WITH fuel_ranked AS (
+  SELECT *, ROW_NUMBER() OVER (
+    PARTITION BY bus_id, expense_date, total_amount, volume_in_liter
+    ORDER BY fuel_expense_id
+  ) AS rn
+  FROM fuel_expense_master
+  WHERE is_deleted = false AND company_id = $1
+    AND fuel_expense_id != 12
+    AND total_amount < 1000000 AND volume_in_liter BETWEEN 1 AND 500 AND fuel_price BETWEEN 50 AND 150
+),
+fuel AS (SELECT * FROM fuel_ranked WHERE rn = 1)
+"""
+
+FUEL_TODAY_YESTERDAY = _FUEL_DEDUP + """
 SELECT
   ROUND(SUM(CASE WHEN expense_date = CURRENT_DATE THEN total_amount ELSE 0 END)::numeric, 2) AS today_spend,
   ROUND(SUM(CASE WHEN expense_date = CURRENT_DATE - INTERVAL '1 day' THEN total_amount ELSE 0 END)::numeric, 2) AS yesterday_spend,
   ROUND(SUM(CASE WHEN expense_date = CURRENT_DATE THEN volume_in_liter ELSE 0 END)::numeric, 2) AS today_liters,
   ROUND(SUM(CASE WHEN expense_date = CURRENT_DATE - INTERVAL '1 day' THEN volume_in_liter ELSE 0 END)::numeric, 2) AS yesterday_liters
-FROM fuel_expense_master
-WHERE is_deleted = false AND company_id = $1
-  AND fuel_expense_id != 12
-  AND total_amount < 1000000 AND volume_in_liter BETWEEN 1 AND 500 AND fuel_price BETWEEN 50 AND 150
-  AND expense_date >= CURRENT_DATE - INTERVAL '1 day'
+FROM fuel
+WHERE expense_date >= CURRENT_DATE - INTERVAL '1 day'
 """
 
-FUEL_MTD = """
+FUEL_MTD = _FUEL_DEDUP + """
 SELECT
   ROUND(SUM(CASE WHEN expense_date >= DATE_TRUNC('month', CURRENT_DATE) THEN total_amount ELSE 0 END)::numeric, 2) AS mtd_spend,
   ROUND(SUM(CASE WHEN expense_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
     AND expense_date < DATE_TRUNC('month', CURRENT_DATE) THEN total_amount ELSE 0 END)::numeric, 2) AS last_month_spend
-FROM fuel_expense_master
-WHERE is_deleted = false AND company_id = $1
-  AND fuel_expense_id != 12
-  AND total_amount < 1000000 AND volume_in_liter BETWEEN 1 AND 500 AND fuel_price BETWEEN 50 AND 150
-  AND expense_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+FROM fuel
+WHERE expense_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
 """
+
+AVG_KM_PER_LITER = _FUEL_DEDUP + """
+SELECT
+  ROUND((SUM(CASE WHEN fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE) THEN br.running_kms ELSE 0 END)::numeric /
+    NULLIF(SUM(CASE WHEN fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE) THEN fe.volume_in_liter ELSE 0 END)::numeric, 0)), 2) AS mtd_km_per_liter,
+  ROUND((SUM(CASE WHEN fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+    AND fe.expense_date < DATE_TRUNC('month', CURRENT_DATE) THEN br.running_kms ELSE 0 END)::numeric /
+    NULLIF(SUM(CASE WHEN fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+    AND fe.expense_date < DATE_TRUNC('month', CURRENT_DATE) THEN fe.volume_in_liter ELSE 0 END)::numeric, 0)), 2) AS last_month_km_per_liter,
+  ROUND(SUM(CASE WHEN fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE) THEN br.running_kms ELSE 0 END)::numeric, 0)::numeric AS mtd_km_covered
+FROM fuel fe
+JOIN bus_routine_master br ON fe.bus_id = br.bus_id AND fe.expense_date = br.routine_start_date
+WHERE br.is_deleted = false AND br.running_kms > 0
+  AND fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+"""
+
+# Non-fuel queries (unchanged)
 
 ATTENDANCE_TODAY = """
 SELECT
@@ -101,22 +128,4 @@ SELECT COUNT(*) AS breakdowns_today
 FROM bus_breakdown_master bb
 JOIN bus_routine_master br ON bb.bus_routine_id = br.bus_routine_id
 WHERE bb.is_deleted = false AND br.company_id = $1 AND br.routine_start_date = CURRENT_DATE
-"""
-
-AVG_KM_PER_LITER = """
-SELECT
-  ROUND((SUM(CASE WHEN fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE) THEN br.running_kms ELSE 0 END)::numeric /
-    NULLIF(SUM(CASE WHEN fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE) THEN fe.volume_in_liter ELSE 0 END)::numeric, 0)), 2) AS mtd_km_per_liter,
-  ROUND((SUM(CASE WHEN fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
-    AND fe.expense_date < DATE_TRUNC('month', CURRENT_DATE) THEN br.running_kms ELSE 0 END)::numeric /
-    NULLIF(SUM(CASE WHEN fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
-    AND fe.expense_date < DATE_TRUNC('month', CURRENT_DATE) THEN fe.volume_in_liter ELSE 0 END)::numeric, 0)), 2) AS last_month_km_per_liter,
-  ROUND(SUM(CASE WHEN fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE) THEN br.running_kms ELSE 0 END)::numeric, 0)::numeric AS mtd_km_covered
-FROM fuel_expense_master fe
-JOIN bus_routine_master br ON fe.bus_id = br.bus_id AND fe.expense_date = br.routine_start_date
-WHERE fe.is_deleted = false AND br.is_deleted = false AND fe.company_id = $1
-  AND fe.fuel_expense_id != 12
-  AND fe.total_amount < 1000000 AND fe.volume_in_liter BETWEEN 1 AND 500 AND fe.fuel_price BETWEEN 50 AND 150
-  AND br.running_kms > 0
-  AND fe.expense_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
 """
